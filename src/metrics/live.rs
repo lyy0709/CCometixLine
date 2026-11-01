@@ -133,20 +133,28 @@ fn bridge<'a>(ctx: &'a Ctx) -> Option<&'a Bridge> {
 }
 
 fn keepalive(ctx: &Ctx, _: &Options) -> Option<Reading> {
-    let Some(b) = bridge(ctx).filter(|b| ctx.now * 1000 - b.updated_at <= 30_000) else {
+    let Some(b) = bridge(ctx) else {
         return Some(
             Reading::default()
                 .set("state", "unavailable")
-                .set("status", "未连接"),
+                .set("status", "模块未就绪"),
         );
     };
     let Some(k) = &b.keepalive else {
         return Some(
             Reading::default()
                 .set("state", "unavailable")
-                .set("status", "未连接"),
+                .set("status", "模块未就绪"),
         );
     };
+    if ctx.now * 1000 - b.updated_at > 30_000 {
+        return Some(
+            Reading::default()
+                .set("state", "unavailable")
+                .set("status", "状态已过期")
+                .set("reason", "插件停止更新"),
+        );
+    }
     let left = k
         .next_at
         .filter(|_| k.state == "countdown")
@@ -381,11 +389,11 @@ mod tests {
         b["updated_at"] = 0.into();
         assert_eq!(
             text("keepalive", "2.1.316", Some(&b.to_string())).as_deref(),
-            Some("KA 未连接")
+            Some("KA 状态已过期 · 插件停止更新")
         );
         assert_eq!(
             text("keepalive", "2.1.316", Some(BRIDGE)).as_deref(),
-            Some("KA 未连接")
+            Some("KA 模块未就绪")
         );
     }
 

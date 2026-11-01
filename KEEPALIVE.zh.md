@@ -1,6 +1,6 @@
 # CCometixLine 原生会话保活
 
-原生保活 fork 版本 `2.0.1-keepalive.3`，基于 Haleclipse/CCometixLine 提交 `56849931745e05d2d4e506af2bedbc8d1f0616d4`。保留上游 Rust 状态栏、TUI、伴随插件和分发结构。保活调度与观测参考 dsh-model-fusion；没有移植其请求重放或认证逻辑。
+原生保活 fork 版本 `2.0.1-keepalive.4`，基于 Haleclipse/CCometixLine 提交 `56849931745e05d2d4e506af2bedbc8d1f0616d4`。保留上游 Rust 状态栏、TUI、伴随插件和分发结构。保活调度与观测参考 dsh-model-fusion；没有移植其请求重放或认证逻辑。
 
 ## 行为
 
@@ -100,7 +100,10 @@ enabled = true
 | KA 正在输入 | draft | 会话空闲，输入框有未发送内容 |
 | KA 正在保活 | sending | 当前保活轮次正在执行 |
 | KA 已暂停 · 原因 | paused | 缓存条件不满足或发生异常 |
-| KA 未连接 | unavailable | 没有当前模块数据或桥接数据过期 |
+| KA 模块未就绪 | unavailable | 尚未收到当前会话的保活模块数据 |
+| KA 状态已过期 · 插件停止更新 | unavailable | 模块数据超过 30 秒未更新，不表示 Claude 网络断开 |
+
+`/clear` 和 `/resume` 只结束旧会话，后台检查会绑定新会话并继续更新状态；清空草稿后恢复等待对话或符合条件的倒计时。恢复的历史对话不会立即触发保活，仍须在本次运行中完成一次正常对话。
 
 提交、开始回复、输入编辑和回复结束都会更新显示，状态栏在下一次本地刷新呈现；不必等下一次 10 秒保活检查。暂停原因仅在 paused 状态展示，上一轮保活结果仅在 countdown 状态展示，避免旧提示残留。保活条件与 50 分钟间隔保持不变。
 

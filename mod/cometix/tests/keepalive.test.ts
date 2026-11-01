@@ -205,6 +205,38 @@ test('a repeated SessionStart replaces the old timer and does not replay old idl
   expect(state.submitted.length).toBe(1)
 })
 
+for (const reason of ['clear', 'resume']) {
+  test(`${reason} keeps monitoring the new session without another SessionStart`, async ($, on) => {
+    const { state, clock, human } = await setup($, on)
+    await human(); await clock.advance(IDLE - 10_000)
+    await $.session.end({ reason, sessionId: state.session } as any)
+    state.session = `after-${reason}`
+    await clock.advance(20_000)
+    expect(state.writes.session).toBe(state.session)
+    expect(state.writes.keepalive.state).toBe('waiting')
+    // These transitions emit no SessionStart. Editing must bind the new
+    // session, and deleting the last character must clear its draft state.
+    await $.prompt.edit({ origin: { kind: 'composer' }, text: '', cursor: 0,
+      start: 0, end: 0, inputText: 'draft' })
+    await clock.advance(200)
+    expect(state.writes.session).toBe(state.session)
+    expect(state.writes.keepalive.state).toBe('draft')
+    await $.prompt.edit({ origin: { kind: 'composer' }, text: 'draft', cursor: 5,
+      start: 0, end: 5, inputText: '' })
+    await clock.advance(200)
+    expect(state.writes.keepalive.state).toBe('waiting')
+    expect(state.writes.keepalive.next_at).toBeUndefined()
+    await clock.advance(40_000)
+    expect(clock.now() - state.writes.updated_at < 10_000).toBe(true)
+    expect(state.submitted.length).toBe(0)
+    // A successful new user turn, rather than the restored old deadline,
+    // arms the next cycle; the monitor must still be running then.
+    await human(); await clock.advance(IDLE + 10_000)
+    expect(state.submitted.length).toBe(1)
+    expect(state.writes.session).toBe(state.session)
+  })
+}
+
 
 test('a sleep or clock discontinuity never backfills an overdue ping', async ($, on) => {
   const { state, clock, human } = await setup($, on)

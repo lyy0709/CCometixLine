@@ -109,7 +109,7 @@ async function checkKeepalive($: $) {
   k.checking = true
   try {
     await follow($)
-    if (k !== keep) return
+    if (k !== keep) { await write($); return }
     const revision = k.revision
     const now = await $.clock.now()
     if (k.lastTick && (now - k.lastTick > FRESH_MS || now < k.lastTick)) {
@@ -349,6 +349,7 @@ export const register: Register = (on) => {
     return submitted
   })
   on('prompt.edit', async ($, e, next) => {
+    await follow($)
     const k = keep, revision = ++k.revision
     const edited = await next(e)
     if (k === keep && revision === k.revision) {
@@ -496,10 +497,17 @@ export const register: Register = (on) => {
   })
 
   on('session.end', async ($, e, next) => {
-    keep.timer?.cancel()
-    keep.interactive = false; keep.revision++; keep.eligible = false
+    // /clear and /resume end a transcript, not the interactive process.
+    // They emit no new session.start: retain the monitor so follow() can
+    // bind the new id, resetting eligibility and the old idle deadline.
+    const switching = e.reason === 'clear' || e.reason === 'resume'
+    if (!switching) {
+      keep.timer?.cancel()
+      keep.interactive = false
+    }
+    keep.revision++; keep.eligible = false
     if (keep.pending) keep.pending.cancelled = true
-    pause('会话已结束')
+    pause(switching ? '正在切换会话' : '会话已结束')
     live.tools.clear()
     live.agents = []
     await write($)
