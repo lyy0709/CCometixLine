@@ -1,10 +1,16 @@
 {
   "name": "cometix",
   "displayName": "ccline status line bridge",
-  "description": "Feeds the ccline status line what its JSON lacks: context by category, the exact auto-compact point, each model request's timing, and the tools and agents running. Draws nothing itself.",
-  "author": { "name": "Haleclipse", "url": "https://github.com/Haleclipse" },
+  "description": "Feeds ccline session metrics and optionally submits a visible native keepalive prompt after 50 idle minutes with a warm one-hour cache.",
+  "author": {
+    "name": "Haleclipse",
+    "url": "https://github.com/Haleclipse"
+  },
   "homepage": "https://github.com/Haleclipse/CCometixLine",
-  "version": "2.0.0",
+  "version": "2.0.1-keepalive.3",
   "license": "MIT",
-  "keywords": ["statusline", "ccline"]
+  "keywords": [
+    "statusline",
+    "ccline"
+  ]
 }

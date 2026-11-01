@@ -177,6 +177,12 @@ impl Default for UpdateConfig {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeepaliveConfig {
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -200,6 +206,7 @@ pub struct Config {
     pub palette_overrides: BTreeMap<String, String>,
     pub git: GitConfig,
     pub update: UpdateConfig,
+    pub keepalive: KeepaliveConfig,
     /// The line drawn for each background task (`subagentStatusLine`); a
     /// built-in line when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,6 +233,7 @@ impl Default for Config {
             palette_overrides: BTreeMap::new(),
             git: GitConfig::default(),
             update: UpdateConfig::default(),
+            keepalive: KeepaliveConfig::default(),
             subagent: None,
             lines: Vec::new(),
         }
@@ -294,6 +302,17 @@ pub fn load_from(path: &Path) -> (Config, LoadNote) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keepalive_is_opt_in_and_round_trips() {
+        let old: Config = toml::from_str("version = 2").unwrap();
+        assert!(!old.keepalive.enabled);
+        let enabled: Config = toml::from_str("[keepalive]\nenabled = true").unwrap();
+        assert!(enabled.keepalive.enabled);
+        let saved: Config = toml::from_str(&enabled.to_toml()).unwrap();
+        assert!(saved.keepalive.enabled);
+        assert!(toml::from_str::<Config>("[keepalive]\nenabled = 'yes'").is_err());
+    }
 
     #[test]
     fn ignores_the_removed_overflow_setting() {

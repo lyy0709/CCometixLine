@@ -1,5 +1,7 @@
 # CCometixLine
 
+> Native keepalive fork (`keepalive` branch): [原生会话保活安装与说明](KEEPALIVE.zh.md).
+
 [English](README.md) | [中文](README.zh.md)
 
 A fast, composable status line for Claude Code, written in Rust, with a full-screen configurator.

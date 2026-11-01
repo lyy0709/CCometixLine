@@ -41,6 +41,25 @@ fn meta(
 pub(super) fn metrics() -> Vec<Metric> {
     vec![
         Metric {
+            meta: meta(
+                "keepalive",
+                Category::Cache,
+                "Native keepalive",
+                "Visible native prompt after 50 idle minutes; requires a warm one-hour cache",
+                IconKey::Cache,
+                [
+                    "KA {status}[ · {reason}][ · {result}]",
+                    "KA {status}",
+                    "KA {status}",
+                ],
+                &[
+                    "state", "status", "left", "reason", "result", "attempts", "replies", "read",
+                    "write",
+                ],
+            ),
+            compute: keepalive,
+        },
+        Metric {
             meta: MetricMeta {
                 // Its ratio is the window's use, as `context`'s is.
                 levels: super::LEVELS,
@@ -111,6 +130,63 @@ pub(super) fn metrics() -> Vec<Metric> {
 
 fn bridge<'a>(ctx: &'a Ctx) -> Option<&'a Bridge> {
     ctx.state.bridge.as_deref()
+}
+
+fn keepalive(ctx: &Ctx, _: &Options) -> Option<Reading> {
+    let Some(b) = bridge(ctx).filter(|b| ctx.now * 1000 - b.updated_at <= 30_000) else {
+        return Some(
+            Reading::default()
+                .set("state", "unavailable")
+                .set("status", "未连接"),
+        );
+    };
+    let Some(k) = &b.keepalive else {
+        return Some(
+            Reading::default()
+                .set("state", "unavailable")
+                .set("status", "未连接"),
+        );
+    };
+    let left = k
+        .next_at
+        .filter(|_| k.state == "countdown")
+        .map(|t| fmt::countdown((t - ctx.now * 1000).max(0) / 1000));
+    let status = match k.state.as_str() {
+        "busy" => "正在对话".into(),
+        "draft" => "正在输入".into(),
+        "sending" => "正在保活".into(),
+        "waiting" => "等待对话".into(),
+        "off" => "已关闭".into(),
+        "paused" => "已暂停".into(),
+        "countdown" => left
+            .as_ref()
+            .map(|t| format!("{t} 后保活"))
+            .unwrap_or_else(|| "等待保活".into()),
+        _ => "未知状态".into(),
+    };
+    let mut r = Reading::default()
+        .set("state", &k.state)
+        .set("status", status)
+        .set("attempts", k.attempts.to_string())
+        .set("replies", k.replies.to_string())
+        .set("read", k.cache_read_tokens.to_string())
+        .set("write", k.cache_write_tokens.to_string());
+    if let Some(left) = left {
+        r = r.set("left", left);
+    }
+    // Reasons describe pauses only, including when an older loaded module
+    // still sends a stale reason alongside a busy state.
+    if k.state == "paused"
+        && let Some(reason) = &k.reason
+    {
+        r = r.set("reason", reason);
+    }
+    if k.state == "countdown"
+        && let Some(result) = &k.last_result
+    {
+        r = r.set("result", result);
+    }
+    Some(r)
 }
 
 /// `/context`'s row labels, shortened.
@@ -279,6 +355,56 @@ mod tests {
                 .map(|p| p.text.as_str())
                 .collect(),
         )
+    }
+
+    #[test]
+    fn keepalive_shows_countdown_results_and_missing_or_stale_modules() {
+        let mut b: serde_json::Value = serde_json::from_str(BRIDGE).unwrap();
+        b["keepalive"] = serde_json::json!({"state": "countdown", "next_at": 1790808800000_i64,
+            "last_result": "缓存命中", "attempts": 1, "replies": 1});
+        assert_eq!(
+            text("keepalive", "2.1.316", Some(&b.to_string())).as_deref(),
+            Some("KA 0:20 后保活 · 缓存命中")
+        );
+        // ctx.now has whole-second precision; don't show 50:01 at arming.
+        b["keepalive"]["next_at"] = 1790811780999_i64.into();
+        assert!(
+            text("keepalive", "2.1.316", Some(&b.to_string()))
+                .unwrap()
+                .contains("50:00")
+        );
+        b["keepalive"]["state"] = "paused".into();
+        b["keepalive"]["reason"] = "五分钟缓存，已暂停".into();
+        let paused = text("keepalive", "2.1.316", Some(&b.to_string())).unwrap();
+        assert!(paused.contains("五分钟缓存，已暂停"));
+        assert!(!paused.contains("0:20"));
+        b["updated_at"] = 0.into();
+        assert_eq!(
+            text("keepalive", "2.1.316", Some(&b.to_string())).as_deref(),
+            Some("KA 未连接")
+        );
+        assert_eq!(
+            text("keepalive", "2.1.316", Some(BRIDGE)).as_deref(),
+            Some("KA 未连接")
+        );
+    }
+
+    #[test]
+    fn normal_activity_never_shows_stale_pause_reasons_or_results() {
+        let mut b: serde_json::Value = serde_json::from_str(BRIDGE).unwrap();
+        for (state, label) in [
+            ("busy", "正在对话"),
+            ("draft", "正在输入"),
+            ("sending", "正在保活"),
+            ("waiting", "等待对话"),
+            ("off", "已关闭"),
+        ] {
+            b["keepalive"] = serde_json::json!({"state": state, "reason": "输入框有草稿", "last_result": "缓存命中"});
+            assert_eq!(
+                text("keepalive", "2.1.316", Some(&b.to_string())).unwrap(),
+                format!("KA {label}")
+            );
+        }
     }
 
     #[test]

@@ -68,6 +68,8 @@ impl Sample {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionState {
     #[serde(default)]
+    pub keepalive: crate::config::KeepaliveConfig,
+    #[serde(default)]
     pub samples: Vec<Sample>,
     /// The latest stdin payload, for previews and the TUI.
     #[serde(default, skip_serializing_if = "Option::is_none")]

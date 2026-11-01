@@ -74,7 +74,7 @@ fn run(subagent: bool) {
     let registry = Registry::load();
     let settings = ClaudeSettings::for_input(&input);
     let (now, tz) = (Utc::now().timestamp(), *Local::now().offset());
-    let mut view = state::observe(&input, &text, &registry, now, tz);
+    let mut view = state::observe(&input, &text, &registry, now, tz, &config.keepalive);
     view.latest_version = state::update::available(&config.update, now);
     let frame = Frame {
         now,

@@ -34,6 +34,22 @@ pub struct Bridge {
     /// Tool calls running now.
     pub tools: Vec<Tool>,
     pub agents: Vec<Agent>,
+    pub keepalive: Option<Keepalive>,
+}
+
+/// Native keepalive status, absent with older companion modules.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Keepalive {
+    pub state: String,
+    pub reason: Option<String>,
+    pub next_at: Option<i64>,
+    pub last_at: Option<i64>,
+    pub attempts: u64,
+    pub replies: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub last_result: Option<String>,
 }
 
 /// The context window as `/context` breaks it down.

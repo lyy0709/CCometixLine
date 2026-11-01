@@ -30,7 +30,7 @@ enum Pane {
 /// In the order they sit on screen: left to right, top to bottom.
 const PANES: [Pane; 4] = [Pane::StatusLine, Pane::Mod, Pane::Agents, Pane::Updates];
 /// Rows per pane; the status line's last row applies the draft.
-const ROWS: [usize; 4] = [5, 2, 2, 3];
+const ROWS: [usize; 4] = [5, 3, 2, 3];
 const REFRESH: [Option<u64>; 7] = [
     None,
     Some(1),
@@ -76,6 +76,19 @@ fn step<T: PartialEq + Copy>(all: &[T], current: T, forward: bool) -> T {
 
 fn on_off(on: bool) -> Span<'static> {
     ui::choice(if on { "on" } else { "off" })
+}
+
+fn session_status(cx: &Cx, now: i64) -> String {
+    cx.env
+        .session
+        .as_ref()
+        .and_then(|s| s.last_input.as_ref())
+        .and_then(|i| i.get("session_id")?.as_str())
+        .and_then(|id| crate::state::bridge::read(id, now))
+        .filter(|b| now - b.updated_at <= 30_000)
+        .and_then(|b| b.keepalive)
+        .map(|k| k.reason.unwrap_or(k.state))
+        .unwrap_or_else(|| "module not running / awaiting session".into())
 }
 
 impl ClaudePage {
@@ -412,20 +425,21 @@ impl ClaudePage {
                 )],
                 at,
             ),
+            self.row(
+                pane,
+                2,
+                "keepalive",
+                vec![on_off(cx.doc.config.keepalive.enabled), Span::raw(" · 50m")],
+                at,
+            ),
             Self::info(pane, "needs", needs, width),
             Self::info(pane, "bridge", bridge, width),
-            Self::info(
-                pane,
-                "adds",
-                Span::raw("context by kind, compact point,"),
-                width,
-            ),
-            Self::info(pane, "", Span::raw("tools, agents, turn timing"), width),
+            Self::info(pane, "KA", Span::raw(session_status(cx, now_ms)), width),
         ];
         f.render_widget(Paragraph::new(text).block(block), area);
     }
 
-    fn handle_mod(&mut self, key: KeyEvent) -> Outcome {
+    fn handle_mod(&mut self, key: KeyEvent, doc: &mut Doc) -> Outcome {
         let installed = !matches!(companion::status(), Status::NotInstalled);
         match (self.rows[Pane::Mod as usize], key.code) {
             (0, KeyCode::Enter) => Outcome::Open(Box::new(ModSteps { install: true })),
@@ -433,6 +447,47 @@ impl ClaudePage {
                 Outcome::Open(Box::new(ModSteps { install: false }))
             }
             (1, KeyCode::Enter) => Outcome::Toast("The companion mod isn't installed".into()),
+            (2, KeyCode::Enter | KeyCode::Char(' ')) => {
+                if !doc.config.keepalive.enabled
+                    && !matches!(companion::status(), Status::Current(_))
+                {
+                    return Outcome::Open(Box::new(ModSteps { install: true }));
+                }
+                let enabling = !doc.config.keepalive.enabled;
+                doc.edit(|c, _| {
+                    c.keepalive.enabled = enabling;
+                    if enabling
+                        && !c.lines.iter().any(|l| {
+                            l.left
+                                .iter()
+                                .chain(&l.right)
+                                .any(|i| i.config().metric == "keepalive")
+                        })
+                        && let Some(line) = c.lines.first_mut()
+                    {
+                        line.left
+                            .push(crate::config::ItemSpec::Id("keepalive".into()));
+                    }
+                });
+                if enabling {
+                    if self.current().and_then(Settings::status_line).is_none() {
+                        self.edit(|d| {
+                            d.set_status_line(Some(&StatusLine {
+                                command: cc_settings::suggested_command(),
+                                padding: Some(0),
+                                refresh_interval: Some(2),
+                                hide_vim_mode_indicator: None,
+                            }))
+                        });
+                    } else {
+                        self.edit_line(|l| {
+                            l.command = cc_settings::suggested_command();
+                            l.refresh_interval = Some(2);
+                        });
+                    }
+                }
+                Outcome::Toast("Save config (Ctrl+S); review statusLine changes (a). Restart Claude after mod install.".into())
+            }
             _ => Outcome::Ignored,
         }
     }
@@ -567,7 +622,7 @@ impl Page for ClaudePage {
         }
         match self.pane {
             Pane::StatusLine => self.handle_status_line(key),
-            Pane::Mod => self.handle_mod(key),
+            Pane::Mod => self.handle_mod(key, doc),
             Pane::Agents => self.handle_agents(key),
             Pane::Updates => self.handle_updates(key, doc),
         }

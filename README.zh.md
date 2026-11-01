@@ -1,5 +1,7 @@
 # CCometixLine
 
+> Native keepalive fork (`keepalive` branch): [原生会话保活安装与说明](KEEPALIVE.zh.md).
+
 [English](README.md) | [中文](README.zh.md)
 
 用 Rust 编写的 Claude Code 状态栏：渲染快、可自由组合，自带全屏配置器。

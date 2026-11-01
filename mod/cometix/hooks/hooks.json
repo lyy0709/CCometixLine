@@ -1,4 +1,6 @@
 {
-  "description": "Writes session data for the ccline status line",
-  "modules": ["./ccline.ts"]
+  "description": "Session metrics and opt-in native Claude Code prompt cache keepalive",
+  "modules": [
+    "./ccline.ts"
+  ]
 }

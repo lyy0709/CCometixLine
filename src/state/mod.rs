@@ -180,6 +180,7 @@ pub fn observe(
     registry: &Registry,
     now: i64,
     tz: FixedOffset,
+    keepalive: &crate::config::KeepaliveConfig,
 ) -> StateView {
     let current = Sample::from_input(input, now);
     let Some(id) = input
@@ -194,7 +195,8 @@ pub fn observe(
     };
 
     let mut session = SessionState::load(id);
-    let added = session.record(current);
+    let added = session.record(current) || session.keepalive != *keepalive;
+    session.keepalive = keepalive.clone();
     session.last_input = serde_json::from_str(raw).ok();
     session.save_if_needed(id, now, added);
 

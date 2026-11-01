@@ -1,0 +1,287 @@
+import { expect, mock, test } from 'claude-code/testing'
+import type { On } from 'claude-code'
+
+const IDLE = 3_000_000
+const PING = '[CCometixLine 保活] 仅回复 OK。不要调用工具，不要继续之前的任务。'
+
+async function setup($: any, on: On) {
+  // Offset only the wall clock reading; scheduled timers still advance on
+  // the deterministic clock, so a suspended machine is observable as a gap.
+  const clock = mock.clock(((event: any, handler: any) => {
+    if (event === 'clock.now') on(event, async ($, e, next) => {
+      const result = await handler($, e, next)
+      return { value: result.value + state.wallOffset }
+    })
+    else on(event, handler)
+  }) as On, { now: 1_000_000 })
+  const state = {
+    wallOffset: 0, session: 's1', enabled: true, ttl: '1h', warm: true, stale: false,
+    expires: 10_000_000, draft: '', active: false, rejected: false,
+    readError: false, submitted: [] as string[], aborts: [] as string[],
+    writes: {} as any, model: 'claude-test', beforeModel: undefined as (() => Promise<void>) | undefined,
+    beforeDraft: undefined as (() => void) | undefined,
+  }
+  on('fs.read', (_, e) => {
+    if (e.path.endsWith('bridge.json')) return { value: JSON.stringify({ dir: '/ccline/bridge' }) }
+    if (state.readError) return { value: '{incomplete' }
+    return { value: JSON.stringify({ saved_at: (clock.now() + state.wallOffset - (state.stale ? 60_000 : 0)) / 1000,
+      keepalive: { enabled: state.enabled }, last_input: { session_id: state.session, model: { id: state.model },
+        prompt_cache: { ttl: state.ttl, warm: state.warm, caching_observed: true, expires_at: state.expires / 1000 } } }) }
+  })
+  on('fs.write', (_, e) => { state.writes = JSON.parse(e.text); return { value: undefined } })
+  on('session.id', () => ({ value: state.session }))
+  on('session.model', async () => {
+    const action = state.beforeModel; state.beforeModel = undefined
+    await action?.()
+    return { value: state.model }
+  })
+  on('session.usage', () => ({ value: { context: {}, rateLimits: [] } }))
+  on('agent.list', () => ({ value: state.active ? [{ id: 'a1', status: 'running' }] : [] }))
+  on('prompt.read', () => {
+    state.beforeDraft?.()
+    return { value: { text: state.draft, cursor: 0 } }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.end', () => ({ sessionId: state.session }))
+  on('session.append', (_, e, next) => next(e))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+  on('turn.abort', (_, e) => { state.aborts.push(e.turnId); return { value: undefined } })
+  on('prompt.edit', (_, e) => {
+    state.draft = e.text.slice(0, e.start) + e.inputText + e.text.slice(e.end)
+    return { text: state.draft, cursor: e.start + e.inputText.length }
+  })
+  on('tool.call', () => ({ result: 'ordinary result' }))
+  on('ui.log', () => ({ value: undefined }))
+  on('prompt.submit', async (_, e) => {
+    if (e.text !== PING) { state.draft = ''; return { text: e.text, origin: e.origin } }
+    state.submitted.push(e.text)
+    if (state.rejected) return { drop: 'test policy rejection' }
+    await $.session.append({ door: 'prompt', origin: { kind: 'plugin', name: 'cometix' },
+      uuid: 'ping-row', message: { type: 'user', content: [{ type: 'text', text: PING }] } })
+    await $.turn.start({ text: `The cometix plugin sent a message:\n${PING}`, turnId: 'ping' })
+    return { text: e.text, origin: { kind: 'plugin', name: 'cometix' } }
+  })
+  const complete = (id = 'human', reason = 'answer') => $.turn.complete({
+    turnId: id, answer: 'OK', durationMs: 1, isAborted: reason === 'aborted', reason,
+    usage: { input_tokens: 4, output_tokens: 4, cache_read_input_tokens: 2000, cache_creation_input_tokens: 100, model: 'claude-test' },
+  })
+  const human = async () => {
+    await $.prompt.submit({ text: 'hello', origin: { kind: 'composer' }, wait: false })
+    await $.turn.start({ text: 'hello', turnId: 'human' })
+    await complete()
+  }
+  await $.session.start({ cwd: '/test', surface: 'terminal', isInteractive: true })
+  return { state, clock, human, complete }
+}
+
+test('50 minute boundary, one in-flight prompt, and repeated idle cycles', async ($, on) => {
+  const { state, clock, human, complete } = await setup($, on)
+  await human()
+  await clock.advance(IDLE - 1)
+  expect(state.submitted.length).toBe(0)
+  await clock.advance(1)
+  expect(state.submitted).toEqual([PING])
+  await clock.advance(20_000)
+  expect(state.submitted.length).toBe(1)
+  await complete('ping')
+  await clock.advance(200)
+  expect(state.writes.keepalive.replies).toBe(1)
+  expect(state.writes.keepalive.cache_read_tokens).toBe(2000)
+  await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(2)
+})
+
+test('drafts, active tasks, short/unknown TTL, expiry and stale snapshots defer sending', async ($, on) => {
+  const { state, clock, human } = await setup($, on)
+  await human()
+  state.draft = 'unfinished'
+  await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(0)
+  state.draft = ''; state.active = true
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(0)
+  state.active = false
+  for (const ttl of ['5m', 'unknown']) {
+    state.ttl = ttl; await clock.advance(10_000)
+    expect(state.submitted.length).toBe(0)
+  }
+  state.ttl = '1h'; state.warm = false
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(0)
+  state.warm = true; state.stale = true
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(0)
+  state.stale = false; state.readError = true
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(0)
+  state.readError = false; state.expires = clock.now()
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(0)
+  state.expires = clock.now() + 3_600_000
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(1)
+})
+
+test('rejected or failed keepalive pauses until a normal user turn succeeds', async ($, on) => {
+  const { state, clock, human, complete } = await setup($, on)
+  state.rejected = true
+  await human(); await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(1)
+  await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(1)
+  state.rejected = false; state.expires = clock.now() + 10_000_000
+  await human(); await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(2)
+  await complete('ping', 'error')
+  await clock.advance(200)
+  expect(state.writes.keepalive.reason).toContain('error')
+  await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(2)
+})
+
+test('native keepalive refuses tools and user input cancels only its own turn', async ($, on) => {
+  const { state, clock, human, complete } = await setup($, on)
+  await human(); await clock.advance(IDLE)
+  const result = await $.tool.call({ tool: 'Glob', pattern: '*' })
+  expect(result.deny).toContain('保活')
+  expect(state.aborts).toEqual(['ping'])
+  await complete('ping', 'aborted')
+  await clock.advance(200)
+  expect(state.writes.keepalive.reason).toContain('调用工具')
+  expect(await $.tool.call({ tool: 'Glob', pattern: '*' })).toEqual(expect.objectContaining({ result: 'ordinary result' }))
+  // Completing off the poll boundary may defer the next send by up to 10s.
+  await human(); await clock.advance(IDLE + 10_000)
+  expect(state.submitted.length).toBe(2)
+  await $.prompt.submit({ text: 'new user task', origin: { kind: 'composer' }, wait: false } as any)
+  expect(state.aborts).toEqual(['ping', 'ping'])
+})
+
+test('disabled and restarted sessions do not replay timers; exit stops the timer', async ($, on) => {
+  const { state, clock, human } = await setup($, on)
+  await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(0)
+  await human(); state.enabled = false
+  await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(0)
+  state.enabled = true
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(0)
+  await human(); await $.session.end({ reason: 'exit' } as any)
+  await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(0)
+})
+
+
+test('busy turns are never interrupted and session changes need a fresh human turn', async ($, on) => {
+  const { state, clock, human, complete } = await setup($, on)
+  await human()
+  await $.prompt.submit({ text: 'long task', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'long task', turnId: 'long' })
+  await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(0)
+  expect(state.aborts.length).toBe(0)
+  await complete('long')
+  await clock.advance(IDLE - 1)
+  expect(state.submitted.length).toBe(0)
+  await clock.advance(1)
+  expect(state.submitted.length).toBe(1)
+  await complete('ping')
+  state.session = 's2'; state.expires = clock.now() + 10_000_000
+  await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(1)
+  await human(); await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(2)
+  expect(state.writes.session).toBe('s2')
+})
+
+test('a repeated SessionStart replaces the old timer and does not replay old idle time', async ($, on) => {
+  const { state, clock, human } = await setup($, on)
+  await human(); await clock.advance(IDLE - 10_000)
+  await $.session.start({ cwd: '/test', surface: 'terminal', isInteractive: true })
+  await clock.advance(20_000)
+  expect(state.submitted.length).toBe(0)
+  await human(); await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(1)
+})
+
+
+test('a sleep or clock discontinuity never backfills an overdue ping', async ($, on) => {
+  const { state, clock, human } = await setup($, on)
+  await human(); await clock.advance(20_000)
+  state.wallOffset = IDLE
+  state.expires = clock.now() + state.wallOffset + 10_000_000
+  await clock.advance(20_000)
+  expect(state.submitted.length).toBe(0)
+  await human(); await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(1)
+})
+
+test('noninteractive sessions do not arm automatic prompts', async ($, on) => {
+  const { state, clock, human } = await setup($, on)
+  await $.session.start({ cwd: '/test', surface: null, isInteractive: false })
+  await human(); await clock.advance(IDLE * 2)
+  expect(state.submitted.length).toBe(0)
+})
+
+
+test('session end during eligibility reads prevents the pending timer from submitting', async ($, on) => {
+  const { state, clock, human } = await setup($, on)
+  await human(); await clock.advance(IDLE - 10_000)
+  state.beforeModel = async () => { await $.session.end({ reason: 'exit' } as any) }
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(0)
+  expect(state.writes.keepalive.reason).toBe('会话已结束')
+})
+
+test('a model switch during the final draft read invalidates the cache check', async ($, on) => {
+  const { state, clock, human } = await setup($, on)
+  await human(); await clock.advance(IDLE - 10_000)
+  let reads = 0
+  state.beforeDraft = () => { if (++reads === 2) state.model = 'claude-other' }
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(0)
+})
+
+
+test('activity follows prompt events immediately and busy overrides a new draft', async ($, on) => {
+  const { state, clock, human, complete } = await setup($, on)
+  const edit = async (text: string) => {
+    await $.prompt.edit({ origin: { kind: 'composer' }, text: state.draft, cursor: state.draft.length,
+      start: 0, end: state.draft.length, inputText: text })
+    await clock.advance(200)
+  }
+  await human(); await clock.advance(10_000)
+  await edit('unfinished')
+  expect(state.writes.keepalive.state).toBe('draft')
+  expect(state.writes.keepalive.reason).toBeUndefined()
+  await $.prompt.submit({ text: 'hello', origin: { kind: 'composer' }, wait: false })
+  await clock.advance(200)
+  expect(state.writes.keepalive.state).toBe('busy')
+  expect(state.writes.keepalive.reason).toBeUndefined()
+  expect(state.writes.keepalive.next_at).toBeUndefined()
+  await $.turn.start({ text: 'hello', turnId: 'human' })
+  await edit('next question')
+  expect(state.writes.keepalive.state).toBe('busy')
+  await clock.advance(10_000)
+  expect(state.writes.keepalive.state).toBe('busy')
+  expect(state.writes.keepalive.reason).toBeUndefined()
+  await complete(); await clock.advance(200)
+  expect(state.writes.keepalive.state).toBe('draft')
+  await edit('')
+  expect(state.writes.keepalive.state).toBe('countdown')
+  expect(state.writes.keepalive.reason).toBeUndefined()
+  expect(state.submitted.length).toBe(0)
+})
+
+test('prompt activity leaves disabled keepalive off', async ($, on) => {
+  const { state, clock, human } = await setup($, on)
+  state.enabled = false
+  await clock.advance(10_000)
+  await human(); await clock.advance(200)
+  expect(state.writes.keepalive.state).toBe('off')
+  await $.prompt.edit({ origin: { kind: 'composer' }, text: '', cursor: 0, start: 0, end: 0, inputText: 'draft' })
+  await clock.advance(200)
+  expect(state.writes.keepalive.state).toBe('off')
+  expect(state.writes.keepalive.reason).toBeUndefined()
+})
