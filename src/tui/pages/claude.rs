@@ -429,7 +429,10 @@ impl ClaudePage {
                 pane,
                 2,
                 "keepalive",
-                vec![on_off(cx.doc.config.keepalive.enabled), Span::raw(" · 50m")],
+                vec![
+                    on_off(cx.doc.config.keepalive.enabled),
+                    Span::raw(" · cache ≤ 10m"),
+                ],
                 at,
             ),
             Self::info(pane, "needs", needs, width),

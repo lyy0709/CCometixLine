@@ -45,7 +45,7 @@ pub(super) fn metrics() -> Vec<Metric> {
                 "keepalive",
                 Category::Cache,
                 "Native keepalive",
-                "Visible native prompt after 50 idle minutes; requires a warm one-hour cache",
+                "Visible native prompt at ten minutes remaining on a warm one-hour cache",
                 IconKey::Cache,
                 [
                     "KA {status}[ · {reason}][ · {result}]",

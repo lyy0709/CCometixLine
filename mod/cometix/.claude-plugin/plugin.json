@@ -1,13 +1,13 @@
 {
   "name": "cometix",
   "displayName": "ccline status line bridge",
-  "description": "Feeds ccline session metrics and optionally submits a visible native keepalive prompt after 50 idle minutes with a warm one-hour cache.",
+  "description": "Feeds ccline session metrics and optionally submits a visible native keepalive prompt when a warm one-hour cache has ten minutes remaining.",
   "author": {
     "name": "Haleclipse",
     "url": "https://github.com/Haleclipse"
   },
   "homepage": "https://github.com/Haleclipse/CCometixLine",
-  "version": "2.0.1-keepalive.4",
+  "version": "2.0.1-keepalive.5",
   "license": "MIT",
   "keywords": [
     "statusline",

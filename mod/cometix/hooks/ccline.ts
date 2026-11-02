@@ -40,7 +40,7 @@ type Tool = { name: string; since: number; agent?: string }
 type Agent = { id: string; type: string; status: string; description?: string }
 type Chunk = { kind?: string; usage?: { output_tokens?: number; model?: string } | null }
 
-const IDLE_MS = 50 * 60 * 1000
+const CACHE_MARGIN_MS = 10 * 60 * 1000
 const CHECK_MS = 10_000
 const FRESH_MS = 30_000
 const PING = '[CCometixLine 保活] 仅回复 OK。不要调用工具，不要继续之前的任务。'
@@ -56,7 +56,8 @@ function freshKeepalive() {
     timer: undefined as { cancel(): void } | undefined,
     enabled: undefined as boolean | undefined, hasDraft: false,
     interactive: false, checking: false, eligible: false, human: false, queuedHuman: false,
-    busy: false, idleAt: 0, lastTick: 0, revision: 0,
+    busy: false, needsHuman: false, lastTick: 0, revision: 0,
+    nextAt: undefined as number | undefined, sentExpiresAt: undefined as number | undefined,
     turn: undefined as string | undefined,
     ownTurn: undefined as string | undefined,
     ownRow: false,
@@ -70,13 +71,13 @@ function activity(state: 'busy' | 'draft' | 'sending' | 'waiting' | 'countdown')
   if (keep.enabled === false) return
   keep.view.state = state
   keep.view.reason = undefined
-  keep.view.next_at = state === 'countdown' ? keep.idleAt + IDLE_MS : undefined
+  keep.view.next_at = state === 'countdown' ? keep.nextAt : undefined
 }
 function pause(reason: string) {
   keep.view.state = 'paused'; keep.view.reason = reason; keep.view.next_at = undefined
 }
 function failed(reason: string) {
-  keep.eligible = false
+  keep.eligible = false; keep.needsHuman = true
   keep.view.last_result = reason
   pause(reason)
 }
@@ -113,7 +114,7 @@ async function checkKeepalive($: $) {
     const revision = k.revision
     const now = await $.clock.now()
     if (k.lastTick && (now - k.lastTick > FRESH_MS || now < k.lastTick)) {
-      k.eligible = false
+      k.eligible = false; k.needsHuman = true
       pause('时钟中断；等待正常对话')
     }
     k.lastTick = now
@@ -127,7 +128,7 @@ async function checkKeepalive($: $) {
       return
     }
     if (k.pending || k.busy) { activity(k.ownTurn ? 'sending' : 'busy'); return }
-    if (live.tools.size || (await $.agent.list()).some(a => ['pending', 'running', 'waiting'].includes(a.status))) {
+    if ([...live.tools.values()].some(t => t.agent === undefined)) {
       activity('busy'); return
     }
     const draftText = (await $.prompt.read()).text
@@ -135,7 +136,10 @@ async function checkKeepalive($: $) {
     k.hasDraft = draftText !== ''
     if (k.hasDraft) { activity('draft'); return }
     if (!k.eligible) {
-      if (k.view.state !== 'paused') activity('waiting')
+      if (k.view.state !== 'paused') {
+        if (k.needsHuman) pause('等待正常对话恢复保活')
+        else activity('waiting')
+      }
       return
     }
     const pc = doc.last_input?.prompt_cache
@@ -145,8 +149,12 @@ async function checkKeepalive($: $) {
     const model = await $.session.model()
     if (k !== keep || !k.interactive || !k.eligible || revision !== k.revision) return
     if (doc.last_input?.model?.id !== model) { pause('模型已变化；等待状态同步'); return }
+    k.nextAt = pc.expires_at * 1000 - CACHE_MARGIN_MS
+    if (k.sentExpiresAt !== undefined && pc.expires_at * 1000 <= k.sentExpiresAt) {
+      pause('等待缓存续期确认'); return
+    }
     activity('countdown')
-    if (now < k.idleAt + IDLE_MS) return
+    if (now < k.nextAt) return
     // Recheck immediately before handing the prompt to the engine. No await
     // between the final revision check and submit: a human prompt wins a race.
     const latest = await snapshot($)
@@ -159,6 +167,14 @@ async function checkKeepalive($: $) {
     if (currentModel !== model || latest.last_input?.model?.id !== model) { pause('模型已变化；等待状态同步'); return }
     if (latest.keepalive?.enabled !== true || cache?.ttl !== '1h' || cache.warm !== true
         || cache.caching_observed !== true || !Number.isFinite(cache.expires_at) || cache.expires_at * 1000 <= at) return
+    // A normal request can refresh the cache during the final reads. Use
+    // the same expiry as the cache/hit metric, never the turn end time.
+    k.nextAt = cache.expires_at * 1000 - CACHE_MARGIN_MS
+    if (k.sentExpiresAt !== undefined && cache.expires_at * 1000 <= k.sentExpiresAt) {
+      pause('等待缓存续期确认'); return
+    }
+    if (at < k.nextAt) { activity('countdown'); return }
+    k.sentExpiresAt = cache.expires_at * 1000
     const pending = { cancelled: false }
     k.pending = pending; k.ownRow = false
     activity('sending')
@@ -251,7 +267,7 @@ async function write($: $) {
     }
     await $.fs.write(`${to}/${live.session}.json`, JSON.stringify(doc))
   } catch (error) {
-    keep.eligible = false
+    keep.eligible = false; keep.needsHuman = true
     pause('状态写入失败')
     $.ui.log(`ccline keepalive: ${String(error)}`, { to: 'debug' })
   }
@@ -453,15 +469,21 @@ export const register: Register = (on) => {
             keep.view.last_result = (e.usage?.cache_read_input_tokens ?? 0) > 0 ? '缓存命中' : '收到回复，未确认缓存命中'
           } else failed((keep.view.state === 'paused' ? keep.view.reason : undefined) ?? `保活结束：${e.reason}`)
         }
-        if (e.reason === 'answer' && !cancelled && (own || keep.human)) {
-          keep.eligible = true; keep.idleAt = await $.clock.now()
-          activity(keep.hasDraft ? 'draft' : 'countdown')
+        if (e.reason === 'answer' && !cancelled && (!keep.needsHuman || keep.human)) {
+          // Background notifications and scheduled monitoring also refresh
+          // the main cache. Only recovery from failure requires a human turn.
+          keep.eligible = true; keep.needsHuman = false
+          activity(keep.hasDraft ? 'draft' : 'waiting')
           if (!own) keep.view.last_result = undefined
         }
         keep.human = false
         live.turn = { ...live.turn, duration_ms: e.durationMs, ended_at: await now($) }
       }
       await listAgents($)
+      // Let the completed turn leave the hook before a due prompt is queued.
+      if (e.agentId === undefined && keep.eligible) {
+        $.clock.after(0, () => { void checkKeepalive($) })
+      }
       flush($)
     } catch {}
     return answered

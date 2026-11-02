@@ -16,10 +16,11 @@ async function setup($: any, on: On) {
   }) as On, { now: 1_000_000 })
   const state = {
     wallOffset: 0, session: 's1', enabled: true, ttl: '1h', warm: true, stale: false,
-    expires: 10_000_000, draft: '', active: false, rejected: false,
+    expires: 4_600_000, draft: '', active: false, rejected: false, refreshOnComplete: true,
     readError: false, submitted: [] as string[], aborts: [] as string[],
     writes: {} as any, model: 'claude-test', beforeModel: undefined as (() => Promise<void>) | undefined,
     beforeDraft: undefined as (() => void) | undefined,
+    toolGate: undefined as Promise<void> | undefined,
   }
   on('fs.read', (_, e) => {
     if (e.path.endsWith('bridge.json')) return { value: JSON.stringify({ dir: '/ccline/bridge' }) }
@@ -45,13 +46,18 @@ async function setup($: any, on: On) {
   on('session.end', () => ({ sessionId: state.session }))
   on('session.append', (_, e, next) => next(e))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
-  on('turn.complete', (_, e) => ({ text: e.answer }))
+  on('turn.complete', (_, e) => {
+    if (e.reason === 'answer' && e.agentId === undefined && state.refreshOnComplete) {
+      state.expires = clock.now() + state.wallOffset + 3_600_000
+    }
+    return { text: e.answer }
+  })
   on('turn.abort', (_, e) => { state.aborts.push(e.turnId); return { value: undefined } })
   on('prompt.edit', (_, e) => {
     state.draft = e.text.slice(0, e.start) + e.inputText + e.text.slice(e.end)
     return { text: state.draft, cursor: e.start + e.inputText.length }
   })
-  on('tool.call', () => ({ result: 'ordinary result' }))
+  on('tool.call', async () => { await state.toolGate; return { result: 'ordinary result' } })
   on('ui.log', () => ({ value: undefined }))
   on('prompt.submit', async (_, e) => {
     if (e.text !== PING) { state.draft = ''; return { text: e.text, origin: e.origin } }
@@ -75,7 +81,7 @@ async function setup($: any, on: On) {
   return { state, clock, human, complete }
 }
 
-test('50 minute boundary, one in-flight prompt, and repeated idle cycles', async ($, on) => {
+test('cache reaches ten minutes remaining, one in-flight prompt, and renewed cycles', async ($, on) => {
   const { state, clock, human, complete } = await setup($, on)
   await human()
   await clock.advance(IDLE - 1)
@@ -92,16 +98,18 @@ test('50 minute boundary, one in-flight prompt, and repeated idle cycles', async
   expect(state.submitted.length).toBe(2)
 })
 
-test('drafts, active tasks, short/unknown TTL, expiry and stale snapshots defer sending', async ($, on) => {
-  const { state, clock, human } = await setup($, on)
+test('drafts, foreground turns, short/unknown TTL, expiry and stale snapshots defer sending', async ($, on) => {
+  const { state, clock, human, complete } = await setup($, on)
   await human()
   state.draft = 'unfinished'
   await clock.advance(IDLE)
   expect(state.submitted.length).toBe(0)
-  state.draft = ''; state.active = true
+  state.draft = ''
+  await $.turn.start({ text: 'foreground', turnId: 'foreground' })
   await clock.advance(10_000)
   expect(state.submitted.length).toBe(0)
-  state.active = false
+  state.refreshOnComplete = false; state.ttl = '5m'
+  await complete('foreground')
   for (const ttl of ['5m', 'unknown']) {
     state.ttl = ttl; await clock.advance(10_000)
     expect(state.submitted.length).toBe(0)
@@ -118,7 +126,7 @@ test('drafts, active tasks, short/unknown TTL, expiry and stale snapshots defer 
   state.readError = false; state.expires = clock.now()
   await clock.advance(10_000)
   expect(state.submitted.length).toBe(0)
-  state.expires = clock.now() + 3_600_000
+  state.expires = clock.now() + 600_000
   await clock.advance(10_000)
   expect(state.submitted.length).toBe(1)
 })
@@ -317,3 +325,92 @@ test('prompt activity leaves disabled keepalive off', async ($, on) => {
   expect(state.writes.keepalive.state).toBe('off')
   expect(state.writes.keepalive.reason).toBeUndefined()
 })
+
+for (const origin of ['task-notification', 'scheduled-trigger']) {
+  test(`${origin} completion arms cache-based keepalive while background tasks remain`, async ($, on) => {
+    const { state, clock, human, complete } = await setup($, on)
+    await human(); await clock.advance(120_000)
+    await $.prompt.submit({ text: 'monitor result', origin: { kind: origin }, wait: false } as any)
+    await $.turn.start({ text: 'monitor result', turnId: 'monitor' })
+    state.active = true
+    await complete('monitor'); await clock.advance(200)
+    expect(state.writes.keepalive.state).toBe('countdown')
+    expect(state.writes.keepalive.next_at).toBe(state.expires - 600_000)
+    await clock.advance(IDLE - 201)
+    expect(state.submitted.length).toBe(0)
+    await clock.advance(10_001)
+    expect(state.submitted.length).toBe(1)
+  })
+}
+
+test('cache expiry rather than reply completion defines the send time', async ($, on) => {
+  const { state, clock, human, complete } = await setup($, on)
+  await human()
+  await $.prompt.submit({ text: 'long answer', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'long answer', turnId: 'long' })
+  await clock.advance(20 * 60_000)
+  state.refreshOnComplete = false
+  await complete('long'); await clock.advance(200)
+  expect(state.writes.keepalive.next_at).toBe(state.expires - 600_000)
+  await clock.advance(30 * 60_000 - 201)
+  expect(state.submitted.length).toBe(0)
+  await clock.advance(1)
+  expect(state.submitted.length).toBe(1)
+})
+
+test('a cache refresh during final validation postpones the pending send', async ($, on) => {
+  const { state, clock, human } = await setup($, on)
+  await human(); await clock.advance(IDLE - 10_000)
+  let reads = 0
+  // The final snapshot must see a fresh expiry before committing a prompt.
+  state.beforeDraft = () => { if (++reads === 1) state.expires = clock.now() + 3_600_000 }
+  await clock.advance(10_000)
+  expect(state.submitted.length).toBe(0)
+  expect(state.writes.keepalive.next_at).toBe(state.expires - 600_000)
+})
+
+test('a reply without an observed cache renewal cannot send every ten seconds', async ($, on) => {
+  const { state, clock, human, complete } = await setup($, on)
+  await human(); await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(1)
+  state.refreshOnComplete = false
+  await complete('ping'); await clock.advance(60_000)
+  expect(state.submitted.length).toBe(1)
+  expect(state.writes.keepalive.reason).toBe('等待缓存续期确认')
+  state.expires = clock.now() + 3_600_000
+  await clock.advance(10_000)
+  expect(state.writes.keepalive.state).toBe('countdown')
+  await clock.advance(IDLE - 10_000)
+  expect(state.submitted.length).toBe(2)
+})
+
+test('background notifications cannot clear a keepalive failure latch', async ($, on) => {
+  const { state, clock, human, complete } = await setup($, on)
+  state.rejected = true
+  await human(); await clock.advance(IDLE)
+  state.rejected = false
+  await $.prompt.submit({ text: 'monitor', origin: { kind: 'task-notification' }, wait: false })
+  await $.turn.start({ text: 'monitor', turnId: 'monitor' })
+  await complete('monitor'); await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(1)
+  await human(); await clock.advance(IDLE)
+  expect(state.submitted.length).toBe(2)
+})
+
+for (const agentId of [undefined, 'background-agent']) {
+  test(`only foreground tool execution defers a cache-due prompt (${agentId ?? 'main'})`, async ($, on) => {
+    const { state, clock, human } = await setup($, on)
+    await human()
+    let release!: () => void
+    state.toolGate = new Promise<void>(resolve => { release = resolve })
+    const tool = $.tool.call({ tool: 'Bash', command: 'mock-only', agentId } as any)
+    try {
+      await clock.advance(200)
+      expect(state.writes.tools.length).toBe(1)
+      await clock.advance(IDLE - 200)
+      expect(state.submitted.length).toBe(agentId === undefined ? 0 : 1)
+    } finally { release(); await tool }
+    await clock.advance(10_000)
+    expect(state.submitted.length).toBe(1)
+  })
+}
